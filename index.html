@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jogo da Velha 3D</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: rgba(22,27,34,.88); --text: #e6edf3; --muted: #8b949e;
+    --x: #ff5c6c; --o: #4cc2ff; --accent: #ffd166; --border: #30363d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { position: fixed; inset: 0; touch-action: none; }
+  #hud { position: fixed; top: 12px; left: 12px; right: 12px; display: flex; flex-wrap: wrap; gap: 8px;
+    align-items: flex-start; pointer-events: none; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    pointer-events: auto; backdrop-filter: blur(6px); }
+  #status { font-size: 18px; font-weight: 600; min-width: 200px; }
+  #status .x { color: var(--x); } #status .o { color: var(--o); } #status .win { color: var(--accent); }
+  #score { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  #controls { display: flex; flex-wrap: wrap; gap: 6px; max-width: 560px; }
+  button, select { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 10px; font-size: 13px; cursor: pointer; }
+  button:hover, select:hover { border-color: var(--muted); }
+  label.chk { font-size: 13px; display: flex; align-items: center; gap: 5px; color: var(--muted); }
+  #help { position: fixed; bottom: 12px; left: 12px; right: 12px; font-size: 12px; color: var(--muted);
+    max-width: 640px; line-height: 1.5; }
+  #help b { color: var(--text); }
+  #help.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud">
+  <div class="panel">
+    <div id="status"></div>
+    <div id="score"></div>
+  </div>
+  <div class="panel" id="controls">
+    <button id="btnNew">Nova partida</button>
+    <button id="btnFar">Ver de longe</button>
+    <button id="btnNear">Aproximar</button>
+    <button id="btnShape">Restaurar cubo</button>
+    <button id="btnWarp">Deformar</button>
+    <select id="mode" title="Modo de jogo">
+      <option value="pvp">2 jogadores</option>
+      <option value="ai">Contra o computador</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="blockCenter" checked> Centro bloqueado</label>
+    <label class="chk"><input type="checkbox" id="autoRotate"> Girar</label>
+  </div>
+</div>
+
+<div class="panel" id="help">
+  <b>Jogar:</b> clique numa esfera para marcar. Faça 3 em linha em qualquer direção — linhas, colunas,
+  pilares e diagonais atravessando o cubo (49 linhas possíveis).
+  <b>Deformar:</b> arraste as esferas amarelas dos vértices.
+  <b>Câmera:</b> arraste o fundo para girar, roda do mouse / pinça para zoom, botão direito para mover.
+  <a href="#" id="hideHelp" style="color:var(--accent)">ocultar</a>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- Cena ----------
+const container = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d1117);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 2000);
+camera.position.set(9, 7, 11);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.minDistance = 4;
+controls.maxDistance = 200;
+controls.autoRotateSpeed = 1.2;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(8, 14, 10);
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x88aaff, 0.4);
+fill.position.set(-10, -6, -8);
+scene.add(fill);
+
+// Chão de referência (ajuda a perceber escala quando visto de longe)
+const grid = new THREE.GridHelper(80, 40, 0x30363d, 0x1c2128);
+grid.position.y = -7;
+scene.add(grid);
+
+// ---------- Vértices maleáveis ----------
+const S = 3; // meia-aresta do cubo
+// índice do vértice = x + 2y + 4z  (x,y,z ∈ {0,1})
+const DEFAULT_CORNERS = [];
+for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
+  DEFAULT_CORNERS.push(new THREE.Vector3(x ? S : -S, y ? S : -S, z ? S : -S));
+
+const handleGeo = new THREE.SphereGeometry(0.32, 24, 16);
+const handles = DEFAULT_CORNERS.map((p, i) => {
+  const m = new THREE.Mesh(handleGeo, new THREE.MeshStandardMaterial({
+    color: 0xffd166, emissive: 0x553300, roughness: 0.35, metalness: 0.1 }));
+  m.position.copy(p);
+  m.userData = { type: 'handle', index: i };
+  scene.add(m);
+  return m;
+});
+const corner = i => handles[i].position;
+
+// Interpolação trilinear: (u,v,w) ∈ [0,1]³ → ponto dentro do cubo deformado
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3(), _d = new THREE.Vector3();
+function trilerp(u, v, w, out = new THREE.Vector3()) {
+  _a.lerpVectors(corner(0), corner(1), u);  // y0 z0
+  _b.lerpVectors(corner(2), corner(3), u);  // y1 z0
+  _c.lerpVectors(corner(4), corner(5), u);  // y0 z1
+  _d.lerpVectors(corner(6), corner(7), u);  // y1 z1
+  _a.lerp(_b, v); _c.lerp(_d, v);
+  return out.lerpVectors(_a, _c, w);
+}
+
+// ---------- Grade (arestas + divisões internas) ----------
+const SEG = 12; // subdivisão de cada linha para curvar suavemente na deformação
+const gridLines = []; // cada item: função t → (u,v,w)
+const cuts = [0, 1/3, 2/3, 1];
+for (const a of cuts) for (const b of cuts) {
+  gridLines.push({ f: t => [t, a, b], edge: (a % 1 === 0) && (b % 1 === 0) });
+  gridLines.push({ f: t => [a, t, b], edge: (a % 1 === 0) && (b % 1 === 0) });
+  gridLines.push({ f: t => [a, b, t], edge: (a % 1 === 0) && (b % 1 === 0) });
+}
+function makeLines(filter, color, opacity) {
+  const list = gridLines.filter(filter);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(list.length * SEG * 2 * 3), 3));
+  const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+  const obj = new THREE.LineSegments(geo, mat);
+  obj.userData.list = list;
+  scene.add(obj);
+  return obj;
+}
+const edgeLines = makeLines(l => l.edge, 0xffd166, 0.95);
+const innerLines = makeLines(l => !l.edge, 0x8b949e, 0.28);
+const tmpP = new THREE.Vector3();
+function updateLines(obj) {
+  const arr = obj.geometry.attributes.position.array;
+  let k = 0;
+  for (const l of obj.userData.list) {
+    for (let s = 0; s < SEG; s++) {
+      for (const t of [s / SEG, (s + 1) / SEG]) {
+        trilerp(...l.f(t), tmpP);
+        arr[k++] = tmpP.x; arr[k++] = tmpP.y; arr[k++] = tmpP.z;
+      }
+    }
+  }
+  obj.geometry.attributes.position.needsUpdate = true;
+  obj.geometry.computeBoundingSphere();
+}
+
+// ---------- Células 3×3×3 ----------
+const cellGeo = new THREE.SphereGeometry(0.42, 24, 16);
+const cells = [];
+const idx = (x, y, z) => x + 3 * y + 9 * z;
+for (let z = 0; z < 3; z++) for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) {
+  const mesh = new THREE.Mesh(cellGeo, new THREE.MeshStandardMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.18, roughness: 0.4, depthWrite: false }));
+  mesh.userData = { type: 'cell', index: idx(x, y, z) };
+  scene.add(mesh);
+  cells.push({ x, y, z, mesh, marker: null });
+}
+const CENTER = idx(1, 1, 1);
+
+function cellPos(c, out) { return trilerp((c.x + 0.5) / 3, (c.y + 0.5) / 3, (c.z + 0.5) / 3, out); }
+
+// Marcadores X e O
+const matX = new THREE.MeshStandardMaterial({ color: 0xff5c6c, emissive: 0x401018, roughness: 0.3 });
+const matO = new THREE.MeshStandardMaterial({ color: 0x4cc2ff, emissive: 0x0b3040, roughness: 0.3 });
+const barGeo = new THREE.BoxGeometry(0.95, 0.2, 0.2);
+const torusGeo = new THREE.TorusGeometry(0.36, 0.1, 16, 40);
+function makeMarker(p) {
+  const g = new THREE.Group();
+  if (p === 'X') {
+    const a = new THREE.Mesh(barGeo, matX); a.rotation.z = Math.PI / 4;
+    const b = new THREE.Mesh(barGeo, matX); b.rotation.z = -Math.PI / 4;
+    g.add(a, b);
+  } else g.add(new THREE.Mesh(torusGeo, matO));
+  g.scale.setScalar(0.01);
+  scene.add(g);
+  return g;
+}
+
+// Linha da vitória
+let winTube = null;
+function clearWinTube() { if (winTube) { scene.remove(winTube); winTube.geometry.dispose(); winTube = null; } }
+function drawWinTube() {
+  clearWinTube();
+  if (!state.winLine) return;
+  const [a, , c] = state.winLine.map(i => cellPos(cells[i], new THREE.Vector3()));
+  const dir = c.clone().sub(a);
+  const start = a.clone().addScaledVector(dir, -0.25), end = c.clone().addScaledVector(dir, 0.25);
+  const mid = cellPos(cells[state.winLine[1]], new THREE.Vector3());
+  const curve = new THREE.CatmullRomCurve3([start, a, mid, c, end]);
+  winTube = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, 0.07, 10),
+    new THREE.MeshBasicMaterial({ color: 0xffd166 }));
+  scene.add(winTube);
+}
+
+// ---------- Lógica do jogo ----------
+// Todas as 49 linhas vencedoras de um tabuleiro 3×3×3
+const LINES = (() => {
+  const out = [];
+  const dirs = [];
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+    if (!dx && !dy && !dz) continue;
+    // mantém só uma de cada par ±d
+    const first = dx || dy || dz;
+    if (first > 0) dirs.push([dx, dy, dz]);
+  }
+  const ok = v => v >= 0 && v < 3;
+  for (const [dx, dy, dz] of dirs)
+    for (let x = 0; x < 3; x++) for (let y = 0; y < 3; y++) for (let z = 0; z < 3; z++) {
+      const pts = [0, 1, 2].map(t => [x + dx * t, y + dy * t, z + dz * t]);
+      if (pts.every(([a, b, c]) => ok(a) && ok(b) && ok(c))) out.push(pts.map(([a, b, c]) => idx(a, b, c)));
+    }
+  return out;
+})();
+
+const state = { board: Array(27).fill(null), turn: 'X', winner: null, winLine: null, starter: 'X' };
+const score = { X: 0, O: 0, E: 0 };
+const ui = {
+  status: document.getElementById('status'), score: document.getElementById('score'),
+  mode: document.getElementById('mode'), blockCenter: document.getElementById('blockCenter'),
+};
+
+function findWin(board) {
+  for (const l of LINES) {
+    const v = board[l[0]];
+    if (v && v !== '#' && v === board[l[1]] && v === board[l[2]]) return { winner: v, line: l };
+  }
+  return null;
+}
+const freeCells = b => b.map((v, i) => v ? -1 : i).filter(i => i >= 0);
+
+function applyCenterRule() {
+  const blocked = ui.blockCenter.checked;
+  const c = cells[CENTER];
+  if (blocked && !state.board[CENTER]) state.board[CENTER] = '#';
+  if (!blocked && state.board[CENTER] === '#') state.board[CENTER] = null;
+  c.mesh.material.color.set(state.board[CENTER] === '#' ? 0x444c56 : 0xffffff);
+  c.mesh.material.opacity = state.board[CENTER] === '#' ? 0.5 : 0.18;
+}
+
+function render_ui() {
+  const name = p => `<span class="${p.toLowerCase()}">${p}</span>`;
+  if (state.winner === 'E') ui.status.innerHTML = 'Empate!';
+  else if (state.winner) ui.status.innerHTML = `<span class="win">Vitória de</span> ${name(state.winner)}!`;
+  else {
+    const ai = ui.mode.value === 'ai' && state.turn === 'O';
+    ui.status.innerHTML = `Vez de ${name(state.turn)}${ai ? ' (computador)' : ''}`;
+  }
+  ui.score.textContent = `X: ${score.X}   ·   O: ${score.O}   ·   Empates: ${score.E}`;
+}
+
+function play(i) {
+  if (state.winner || state.board[i]) return false;
+  state.board[i] = state.turn;
+  cells[i].marker = makeMarker(state.turn);
+  cells[i].mesh.visible = false;
+  const w = findWin(state.board);
+  if (w) { state.winner = w.winner; state.winLine = w.line; score[w.winner]++; drawWinTube(); }
+  else if (freeCells(state.board).length === 0) { state.winner = 'E'; score.E++; }
+  else state.turn = state.turn === 'X' ? 'O' : 'X';
+  render_ui();
+  maybeAI();
+  return true;
+}
+
+function newGame() {
+  for (const c of cells) {
+    if (c.marker) { scene.remove(c.marker); c.marker = null; }
+    c.mesh.visible = true;
+  }
+  clearWinTube();
+  state.board.fill(null);
+  state.winner = null; state.winLine = null;
+  state.starter = state.starter === 'X' ? 'O' : 'X'; // alterna quem começa
+  state.turn = state.starter;
+  applyCenterRule();
+  render_ui();
+  maybeAI();
+}
+
+// IA: vence > bloqueia > cria duplas ameaças > heurística por linhas
+function aiMove() {
+  const b = state.board, me = 'O', op = 'X';
+  const free = freeCells(b);
+  const completes = p => free.find(i => { b[i] = p; const w = findWin(b); b[i] = null; return w; });
+  let m = completes(me); if (m !== undefined) return m;
+  m = completes(op); if (m !== undefined) return m;
+  let best = -Infinity, choice = free[0];
+  for (const i of free) {
+    let s = 0, threats = 0;
+    for (const l of LINES) if (l.includes(i)) {
+      const vals = l.map(j => b[j]);
+      const mine = vals.filter(v => v === me).length, theirs = vals.filter(v => v === op).length;
+      const dead = vals.includes('#');
+      if (dead) continue;
+      if (!theirs) { s += 1 + mine * 4; if (mine === 1) threats++; }
+      if (!mine) s += 0.8 + theirs * 3;
+    }
+    if (threats >= 2) s += 20;
+    s += Math.random() * 0.5;
+    if (s > best) { best = s; choice = i; }
+  }
+  return choice;
+}
+let aiTimer = null;
+function maybeAI() {
+  clearTimeout(aiTimer);
+  if (ui.mode.value === 'ai' && state.turn === 'O' && !state.winner)
+    aiTimer = setTimeout(() => play(aiMove()), 450);
+}
+
+// ---------- Interação ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const dragPlane = new THREE.Plane();
+const dragOffset = new THREE.Vector3();
+let dragging = null, down = null, hovered = null;
+
+function setPointer(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(pointer, camera);
+}
+function pick(e) {
+  setPointer(e);
+  const targets = [...handles, ...cells.filter(c => c.mesh.visible && state.board[c.mesh.userData.index] !== '#').map(c => c.mesh)];
+  const hit = raycaster.intersectObjects(targets, false)[0];
+  return hit ? hit.object : null;
+}
+
+renderer.domElement.addEventListener('pointerdown', e => {
+  const obj = pick(e);
+  down = { x: e.clientX, y: e.clientY, obj };
+  if (obj && obj.userData.type === 'handle') {
+    dragging = obj;
+    controls.enabled = false;
+    dragPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), obj.position);
+    const hit = new THREE.Vector3();
+    raycaster.ray.intersectPlane(dragPlane, hit);
+    dragOffset.copy(obj.position).sub(hit);
+    renderer.domElement.setPointerCapture(e.pointerId);
+  }
+});
+
+renderer.domElement.addEventListener('pointermove', e => {
+  if (dragging) {
+    setPointer(e);
+    const hit = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(dragPlane, hit)) {
+      dragging.position.copy(hit.add(dragOffset));
+      geometryDirty = true;
+    }
+    return;
+  }
+  if (e.pointerType === 'mouse') {
+    const obj = pick(e);
+    if (hovered !== obj) {
+      if (hovered) hovered.scale.setScalar(1);
+      hovered = obj;
+      if (hovered) hovered.scale.setScalar(1.25);
+      renderer.domElement.style.cursor = obj ? (obj.userData.type === 'handle' ? 'grab' : 'pointer') : 'default';
+    }
+  }
+});
+
+function endPointer(e) {
+  if (dragging) {
+    dragging = null;
+    controls.enabled = true;
+    renderer.domElement.releasePointerCapture?.(e.pointerId);
+  } else if (down && down.obj && down.obj.userData.type === 'cell') {
+    const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+    const humanTurn = !(ui.mode.value === 'ai' && state.turn === 'O');
+    if (moved < 6 && humanTurn && pick(e) === down.obj) play(down.obj.userData.index);
+  }
+  down = null;
+}
+renderer.domElement.addEventListener('pointerup', endPointer);
+renderer.domElement.addEventListener('pointercancel', endPointer);
+
+// ---------- Câmera: animação de distância ----------
+let camAnim = null;
+function flyToDistance(dist) {
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  camAnim = { from: camera.position.clone(), to: controls.target.clone().addScaledVector(dir, dist), t: 0 };
+}
+
+// Animação suave dos vértices (restaurar / deformar)
+let shapeAnim = null;
+function animateCorners(targets) {
+  shapeAnim = { from: handles.map(h => h.position.clone()), to: targets, t: 0 };
+}
+
+document.getElementById('btnNew').onclick = newGame;
+document.getElementById('btnFar').onclick = () => flyToDistance(60);
+document.getElementById('btnNear').onclick = () => flyToDistance(15);
+document.getElementById('btnShape').onclick = () => animateCorners(DEFAULT_CORNERS.map(p => p.clone()));
+document.getElementById('btnWarp').onclick = () => animateCorners(DEFAULT_CORNERS.map(p =>
+  p.clone().multiplyScalar(0.75 + Math.random() * 0.6).add(new THREE.Vector3(
+    (Math.random() - .5) * 2.4, (Math.random() - .5) * 2.4, (Math.random() - .5) * 2.4))));
+ui.mode.onchange = () => { render_ui(); maybeAI(); };
+ui.blockCenter.onchange = () => { if (!state.board.some(v => v === 'X' || v === 'O')) { applyCenterRule(); } else newGame(); };
+document.getElementById('autoRotate').onchange = e => controls.autoRotate = e.target.checked;
+document.getElementById('hideHelp').onclick = e => { e.preventDefault(); document.getElementById('help').classList.add('hidden'); };
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- Loop ----------
+let geometryDirty = true;
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const clock = new THREE.Clock();
+
+function updateGeometry() {
+  updateLines(edgeLines);
+  updateLines(innerLines);
+  for (const c of cells) {
+    cellPos(c, c.mesh.position);
+    if (c.marker) c.marker.position.copy(c.mesh.position);
+  }
+  if (state.winLine) drawWinTube();
+}
+
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (camAnim) {
+    camAnim.t = Math.min(1, camAnim.t + dt / 1.2);
+    camera.position.lerpVectors(camAnim.from, camAnim.to, ease(camAnim.t));
+    if (camAnim.t >= 1) camAnim = null;
+  }
+  if (shapeAnim) {
+    shapeAnim.t = Math.min(1, shapeAnim.t + dt / 0.8);
+    const k = ease(shapeAnim.t);
+    handles.forEach((h, i) => h.position.lerpVectors(shapeAnim.from[i], shapeAnim.to[i], k));
+    geometryDirty = true;
+    if (shapeAnim.t >= 1) shapeAnim = null;
+  }
+  if (geometryDirty) { updateGeometry(); geometryDirty = false; }
+
+  // marcadores sempre de frente para a câmera, com animação de surgimento
+  for (const c of cells) if (c.marker) {
+    c.marker.quaternion.copy(camera.quaternion);
+    const s = c.marker.scale.x;
+    if (s < 1) c.marker.scale.setScalar(Math.min(1, s + dt * 5));
+  }
+  if (winTube) winTube.material.color.setHSL(0.12, 1, 0.55 + 0.15 * Math.sin(clock.elapsedTime * 6));
+
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+
+state.starter = 'O'; // newGame alterna → X começa a primeira partida
+newGame();
+tick();
+</script>
+</body>
+</html>
