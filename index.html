@@ -153,7 +153,6 @@ function makeLines(filter, color, opacity) {
   return obj;
 }
 const edgeLines = makeLines(l => l.edge, 0xffd166, 0.95);
-const innerLines = makeLines(l => !l.edge, 0x8b949e, 0.28);
 const tmpP = new THREE.Vector3();
 function updateLines(obj) {
   const arr = obj.geometry.attributes.position.array;
@@ -176,12 +175,42 @@ const cells = [];
 const idx = (x, y, z) => x + 3 * y + 9 * z;
 for (let z = 0; z < 3; z++) for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) {
   const mesh = new THREE.Mesh(cellGeo, new THREE.MeshStandardMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.18, roughness: 0.4, depthWrite: false }));
+    color: 0xdfe8f2, emissive: 0x2a3440, transparent: true, opacity: 0.55, roughness: 0.35 }));
   mesh.userData = { type: 'cell', index: idx(x, y, z) };
   scene.add(mesh);
   cells.push({ x, y, z, mesh, marker: null });
 }
 const CENTER = idx(1, 1, 1);
+
+// Aparência padrão de uma casa (livre ou bloqueada)
+function baseLook(c) {
+  const blocked = state.board[c.mesh.userData.index] === '#';
+  c.mesh.material.color.set(blocked ? 0x3a424d : 0xdfe8f2);
+  c.mesh.material.emissive.set(blocked ? 0x000000 : 0x2a3440);
+  c.mesh.material.opacity = blocked ? 0.3 : 0.55;
+  c.mesh.scale.setScalar(1);
+}
+
+// Linhas brancas finas ligando cada esfera às vizinhas
+const links = [];
+for (const c of cells) for (const [dx, dy, dz] of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
+  const nx = c.x + dx, ny = c.y + dy, nz = c.z + dz;
+  if (nx < 3 && ny < 3 && nz < 3) links.push([idx(c.x, c.y, c.z), idx(nx, ny, nz)]);
+}
+const linkLines = new THREE.LineSegments(
+  new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(links.length * 6), 3)),
+  new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 }));
+scene.add(linkLines);
+function updateLinks() {
+  const arr = linkLines.geometry.attributes.position.array;
+  let k = 0;
+  for (const [a, b] of links) for (const i of [a, b]) {
+    const p = cells[i].mesh.position;
+    arr[k++] = p.x; arr[k++] = p.y; arr[k++] = p.z;
+  }
+  linkLines.geometry.attributes.position.needsUpdate = true;
+  linkLines.geometry.computeBoundingSphere();
+}
 
 function cellPos(c, out) { return trilerp((c.x + 0.5) / 3, (c.y + 0.5) / 3, (c.z + 0.5) / 3, out); }
 
@@ -259,8 +288,7 @@ function applyCenterRule() {
   const c = cells[CENTER];
   if (blocked && !state.board[CENTER]) state.board[CENTER] = '#';
   if (!blocked && state.board[CENTER] === '#') state.board[CENTER] = null;
-  c.mesh.material.color.set(state.board[CENTER] === '#' ? 0x444c56 : 0xffffff);
-  c.mesh.material.opacity = state.board[CENTER] === '#' ? 0.5 : 0.18;
+  baseLook(c);
 }
 
 function render_ui() {
@@ -277,6 +305,7 @@ function render_ui() {
 function play(i) {
   if (state.winner || state.board[i]) return false;
   state.board[i] = state.turn;
+  setHover(null);
   cells[i].marker = makeMarker(state.turn);
   cells[i].mesh.visible = false;
   const w = findWin(state.board);
@@ -289,12 +318,14 @@ function play(i) {
 }
 
 function newGame() {
+  setHover(null);
+  clearWinTube();
+  state.board.fill(null);
   for (const c of cells) {
     if (c.marker) { scene.remove(c.marker); c.marker = null; }
     c.mesh.visible = true;
+    baseLook(c);
   }
-  clearWinTube();
-  state.board.fill(null);
   state.winner = null; state.winLine = null;
   state.starter = state.starter === 'X' ? 'O' : 'X'; // alterna quem começa
   state.turn = state.starter;
@@ -346,19 +377,72 @@ function setPointer(e) {
   pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(pointer, camera);
 }
+// Seleção por proximidade na tela: escolhe a esfera cujo CENTRO projetado está mais perto
+// do cursor (relativo ao tamanho dela na tela). Assim, uma esfera da frente não "rouba"
+// o clique de outra que aparece logo atrás.
+const _ndc = new THREE.Vector3(), _edge = new THREE.Vector3(), _camUp = new THREE.Vector3();
+function screenCircle(pos, radius, rect) {
+  _ndc.copy(pos).project(camera);
+  if (_ndc.z > 1 || _ndc.z < -1) return null; // atrás da câmera
+  _camUp.setFromMatrixColumn(camera.matrixWorld, 1);
+  _edge.copy(pos).addScaledVector(_camUp, radius).project(camera);
+  return {
+    x: (_ndc.x + 1) / 2 * rect.width,
+    y: (1 - _ndc.y) / 2 * rect.height,
+    r: Math.hypot((_edge.x - _ndc.x) / 2 * rect.width, (_edge.y - _ndc.y) / 2 * rect.height),
+    depth: _ndc.z,
+  };
+}
 function pick(e) {
-  setPointer(e);
-  const targets = [...handles, ...cells.filter(c => c.mesh.visible && state.board[c.mesh.userData.index] !== '#').map(c => c.mesh)];
-  const hit = raycaster.intersectObjects(targets, false)[0];
-  return hit ? hit.object : null;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  const minR = e.pointerType === 'mouse' ? 8 : 16; // alvo mínimo maior no toque
+  let best = null, bestScore = Infinity, bestDepth = Infinity;
+  const consider = (obj, radius, bias) => {
+    const s = screenCircle(obj.position, radius, rect);
+    if (!s) return;
+    const r = Math.max(s.r, minR);
+    const d = Math.hypot(px - s.x, py - s.y);
+    if (d > r * 1.15) return;
+    const score = (d / r) * bias;
+    // em empate praticamente exato, fica com a mais próxima da câmera
+    if (score < bestScore - 0.03 || (score <= bestScore + 0.03 && s.depth < bestDepth)) {
+      best = obj; bestScore = score; bestDepth = s.depth;
+    }
+  };
+  for (const h of handles) consider(h, 0.32, 0.8); // vértices têm leve prioridade
+  for (const c of cells)
+    if (c.mesh.visible && state.board[c.mesh.userData.index] !== '#') consider(c.mesh, 0.42, 1);
+  return best;
+}
+
+const PLAYER_COLOR = { X: 0xff5c6c, O: 0x4cc2ff };
+function setHover(obj) {
+  if (hovered === obj) return;
+  if (hovered) {
+    if (hovered.userData.type === 'cell') baseLook(cells[hovered.userData.index]);
+    else hovered.scale.setScalar(1);
+  }
+  hovered = obj;
+  if (obj) {
+    if (obj.userData.type === 'cell') {
+      obj.material.color.set(PLAYER_COLOR[state.turn]);
+      obj.material.emissive.set(PLAYER_COLOR[state.turn]).multiplyScalar(0.35);
+      obj.material.opacity = 0.9;
+      obj.scale.setScalar(1.15);
+    } else obj.scale.setScalar(1.3);
+  }
+  renderer.domElement.style.cursor = obj ? (obj.userData.type === 'handle' ? 'grab' : 'pointer') : 'default';
 }
 
 renderer.domElement.addEventListener('pointerdown', e => {
   const obj = pick(e);
   down = { x: e.clientX, y: e.clientY, obj };
+  setHover(obj); // no toque, mostra qual esfera foi pega
   if (obj && obj.userData.type === 'handle') {
     dragging = obj;
     controls.enabled = false;
+    setPointer(e);
     dragPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), obj.position);
     const hit = new THREE.Vector3();
     raycaster.ray.intersectPlane(dragPlane, hit);
@@ -377,15 +461,8 @@ renderer.domElement.addEventListener('pointermove', e => {
     }
     return;
   }
-  if (e.pointerType === 'mouse') {
-    const obj = pick(e);
-    if (hovered !== obj) {
-      if (hovered) hovered.scale.setScalar(1);
-      hovered = obj;
-      if (hovered) hovered.scale.setScalar(1.25);
-      renderer.domElement.style.cursor = obj ? (obj.userData.type === 'handle' ? 'grab' : 'pointer') : 'default';
-    }
-  }
+  if (e.pointerType === 'mouse' && !(down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6)) setHover(pick(e));
+  else if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) setHover(null); // girando a câmera
 });
 
 function endPointer(e) {
@@ -396,9 +473,11 @@ function endPointer(e) {
   } else if (down && down.obj && down.obj.userData.type === 'cell') {
     const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
     const humanTurn = !(ui.mode.value === 'ai' && state.turn === 'O');
-    if (moved < 6 && humanTurn && pick(e) === down.obj) play(down.obj.userData.index);
+    // confirma a casa destacada no pointerdown (não recalcula no soltar, evita trocar de alvo)
+    if (moved < 10 && humanTurn) play(down.obj.userData.index);
   }
   down = null;
+  if (e.pointerType !== 'mouse') setHover(null);
 }
 renderer.domElement.addEventListener('pointerup', endPointer);
 renderer.domElement.addEventListener('pointercancel', endPointer);
@@ -441,11 +520,11 @@ const clock = new THREE.Clock();
 
 function updateGeometry() {
   updateLines(edgeLines);
-  updateLines(innerLines);
   for (const c of cells) {
     cellPos(c, c.mesh.position);
     if (c.marker) c.marker.position.copy(c.mesh.position);
   }
+  updateLinks();
   if (state.winLine) drawWinTube();
 }
 
